@@ -1,7 +1,8 @@
 #include <stdio.h>
 #include <algorithm>
 #include <getopt.h>
-
+#include <cstdlib>
+#include <cstring>
 #include "CycleTimer.h"
 
 extern void mandelbrotSerial(
@@ -166,7 +167,6 @@ int main(int argc, char** argv) {
 
     // compute speedup
     printf("\t\t\t\t(%.2fx speedup from %d threads)\n", minSerial/minThread, numThreads);
-
     delete[] output_serial;
     delete[] output_thread;
 
