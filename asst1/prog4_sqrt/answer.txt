@@ -1,0 +1,11 @@
+On AMD Ryzen 7 8745H(8 cores)
+
+Q: What is the speedup due to SIMD parallelization? What is the speedup due to multi-core parallelization?
+A: 4.7x & 14.2x
+
+Q: Does your modification improve SIMD speedup? Does it improve multi-core speedup? Please explain why?
+A: yes, yes. using uniform input would be a good idea to improve speedup, in that case, sereial one's compute time also decrease, change value[i] to `values[i] = .001f + 1.005f * static_cast<float>(rand()) / RAND_MAX;` improved speedup to 5.2x & 73x.
+
+Q: Construct a specific input for `sqrt` that __minimizes speedup for ISPC.
+A: 1.0f, all comput are extremly fast, so speedup also decreased to 2x/1.8x (due to overhead).
+    values[i] = (i % 2 == 0) ? 1.0f : .001f + 2.998f * static_cast<float>(rand()) / RAND_MAX is another workload divergent case;
