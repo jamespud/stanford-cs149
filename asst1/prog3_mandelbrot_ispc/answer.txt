@@ -1,0 +1,15 @@
+On AMD Ryzen 7 8745H(8 cores)
+
+## part 1
+    - Q: What is the maximum speedup you expect?
+        A: 8x with one core (actual 6x)
+    - Q: Why might observed speedup be lower?
+        A: workload divergence (middle)
+
+## part 2
+    - Q:  What speedup do you observe on view 1 with `-t` command?
+        A: 12x with ispc task, 6x without task
+    - Q: How did you determine how many tasks to create? Why does the number you chose work best?
+        A: 32, to meet load balancing granularity
+    - Q: What are differences between the thread  abstraction and the ISPC task abstraction?
+        A: SPMD has lightweight scheduling
