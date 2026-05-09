@@ -1,0 +1,9 @@
+1. What speedup from using ISPC with tasks do you observe? Explain the performance of this program.
+    0.98x. The ISPC SIMD implementation already achieves approximately 52 GB/s memory bandwidth, which is close to the practical memory bandwidth limit of the system.
+
+2. Why is `TOTAL_BYTES = 4 * N * sizeof(float);`?
+    write allocate, when cpu store values, it would read the cache line into cache first, then modify cache line, finally write back later.
+    there is a extra operation.
+
+3. Improve the performance significantly
+    non-temporal store, reduce total memory traffic
