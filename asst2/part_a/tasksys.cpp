@@ -115,73 +115,52 @@ const char* TaskSystemParallelThreadPoolSpinning::name() {
 }
 
 TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int num_threads)
-    : ITaskSystem(num_threads)
-    , mNumThreads(std::max(1, num_threads))
-    , mThreads()
-    , mCurrentRunnable(nullptr)
-    , mCurrentNumTotalTasks(0)
-    , mNextTaskId(0)
-    , mCompletedTasks(0)
-    , mIdleWorkers(0)
-    , mHasActiveRun(false)
-    , mShutdown(false) {
-    mThreads.reserve(mNumThreads);
+    : ITaskSystem(num_threads) {
+    mNumThreads = std::max(1, num_threads);
+
+    mShutdown.store(false);
+    mHasWork.store(false);
+
+    mRunnable = nullptr;
+    mNumTotalTasks = 0;
+
+    mNextTask.store(0);
+    mFinishedTask.store(0);
+
     for (int i = 0; i < mNumThreads; i++) {
-        mThreads.emplace_back(&TaskSystemParallelThreadPoolSpinning::workerLoop, this);
+        mWorkers.emplace_back(&TaskSystemParallelThreadPoolSpinning::workerLoop, this);
     }
 }
 
 TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
-    mShutdown.store(true);
-    mHasActiveRun.store(false);
+    mShutdown.store(true, std::memory_order_seq_cst);
 
-    for (size_t i = 0; i < mThreads.size(); i++) {
-        if (mThreads[i].joinable()) {
-            mThreads[i].join();
-        }
+    for (auto& t : mWorkers) {
+        t.join();
     }
 }
 
 void TaskSystemParallelThreadPoolSpinning::workerLoop() {
-    bool is_idle = false;
-
-    while (!mShutdown.load()) {
-        if (!mHasActiveRun.load()) {
-            if (!is_idle) {
-                mIdleWorkers.fetch_add(1);
-                is_idle = true;
-            }
+    while (!mShutdown.load(std::memory_order_seq_cst)) {
+        if (!mHasWork.load(std::memory_order_acquire)) {
             std::this_thread::yield();
             continue;
         }
 
-        if (is_idle) {
-            mIdleWorkers.fetch_sub(1);
-            is_idle = false;
-        }
+        int taskId = mNextTask.fetch_add(1);
 
-        IRunnable* runnable = mCurrentRunnable.load();
-        int num_total_tasks = mCurrentNumTotalTasks.load();
-        if (runnable == nullptr || num_total_tasks <= 0) {
+        if (taskId >= mNumTotalTasks) {
             std::this_thread::yield();
             continue;
         }
 
-        int task_id = mNextTaskId.fetch_add(1);
-        if (task_id >= num_total_tasks) {
-            std::this_thread::yield();
-            continue;
-        }
+        mRunnable->runTask(taskId, mNumTotalTasks);
 
-        runnable->runTask(task_id, num_total_tasks);
-        int completed = mCompletedTasks.fetch_add(1) + 1;
-        if (completed == num_total_tasks) {
-            mHasActiveRun.store(false);
-        }
-    }
+        int finished = mFinishedTask.fetch_add(1) + 1;
 
-    if (is_idle) {
-        mIdleWorkers.fetch_sub(1);
+        if (finished == mNumTotalTasks) {
+            mHasWork.store(false, std::memory_order_release);
+        }
     }
 }
 
@@ -190,29 +169,20 @@ void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_tota
         return;
     }
 
-    assert(runnable != nullptr);
-    if (runnable == nullptr) {
-        return;
-    }
+    mRunnable = runnable;
+    mNumTotalTasks = num_total_tasks;
 
-    std::lock_guard<std::mutex> run_lock(mRunMutex);
-    while (mHasActiveRun.load() || mIdleWorkers.load() != mNumThreads) {
-        if (mShutdown.load()) {
-            return;
-        }
-        std::this_thread::yield();
-    }
+    mNextTask.store(0);
+    mFinishedTask.store(0);
 
-    mNextTaskId.store(0);
-    mCompletedTasks.store(0);
-    mCurrentNumTotalTasks.store(num_total_tasks);
-    mCurrentRunnable.store(runnable);
-    mHasActiveRun.store(true);
+    /*
+     * release:
+     * 保证 runnable / num_total_tasks
+     * 在 worker 看到 hasWork=true 前可见
+     */
+    mHasWork.store(true, std::memory_order_release);
 
-    while (mHasActiveRun.load()) {
-        if (mShutdown.load()) {
-            break;
-        }
+    while (mHasWork.load(std::memory_order_acquire)) {
         std::this_thread::yield();
     }
 }
@@ -239,72 +209,65 @@ const char* TaskSystemParallelThreadPoolSleeping::name() {
 }
 
 TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int num_threads)
-    : ITaskSystem(num_threads)
-    , mNumThreads(std::max(1, num_threads))
-    , mThreads()
-    , mCurrentRunnable(nullptr)
-    , mCurrentNumTotalTasks(0)
-    , mNextTaskId(0)
-    , mCompletedTasks(0)
-    , mHasActiveRun(false)
-    , mShutdown(false) {
-    mThreads.reserve(mNumThreads);
+    : ITaskSystem(num_threads) {
+    mNumThreads = std::max(1, num_threads);
+
+    mShutdown.store(false);
+
+    mRunnable = nullptr;
+    mNumTotalTasks = 0;
+
+    mNextTask.store(0);
+    mFinishedTask.store(0);
+
+    mHasWork = false;
+
     for (int i = 0; i < mNumThreads; i++) {
-        mThreads.emplace_back(&TaskSystemParallelThreadPoolSleeping::workerLoop, this);
+        mWorkers.emplace_back(&TaskSystemParallelThreadPoolSleeping::workerLoop, this);
     }
 }
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
     {
-        std::lock_guard<std::mutex> lock(mMutex);
-        mShutdown = true;
-        mHasActiveRun = false;
+        std::unique_lock<std::mutex> lock(mMutex);
+        mShutdown.store(true);
+        mHasWork = true;
     }
-    mWorkAvailableCV.notify_all();
-    mLaunchDoneCV.notify_all();
 
-    for (size_t i = 0; i < mThreads.size(); i++) {
-        if (mThreads[i].joinable()) {
-            mThreads[i].join();
-        }
+    mCVWork.notify_all();
+
+    for (auto& t : mWorkers) {
+        t.join();
     }
 }
 
 void TaskSystemParallelThreadPoolSleeping::workerLoop() {
     while (true) {
-        std::unique_lock<std::mutex> lock(mMutex);
-        mWorkAvailableCV.wait(lock, [this]() {
-            return mShutdown || mHasActiveRun;
-        });
+        {
+            std::unique_lock<std::mutex> lock(mMutex);
 
-        if (mShutdown) {
-            return;
+            mCVWork.wait(lock, [&]() { return mHasWork || mShutdown.load(); });
+
+            if (mShutdown.load()) {
+                return;
+            }
         }
 
-        while (mHasActiveRun && !mShutdown) {
-            if (mNextTaskId >= mCurrentNumTotalTasks) {
-                mWorkAvailableCV.wait(lock, [this]() {
-                    return mShutdown || !mHasActiveRun || (mNextTaskId < mCurrentNumTotalTasks);
-                });
-                if (mShutdown) {
-                    return;
-                }
-                continue;
+        while (true) {
+            int taskId = mNextTask.fetch_add(1);
+
+            if (taskId >= mNumTotalTasks) {
+                break;
             }
 
-            int task_id = mNextTaskId++;
-            IRunnable* runnable = mCurrentRunnable;
-            int num_total_tasks = mCurrentNumTotalTasks;
+            mRunnable->runTask(taskId, mNumTotalTasks);
 
-            lock.unlock();
-            runnable->runTask(task_id, num_total_tasks);
-            lock.lock();
+            int finished = mFinishedTask.fetch_add(1) + 1;
 
-            mCompletedTasks++;
-            if (mCompletedTasks == mCurrentNumTotalTasks) {
-                mHasActiveRun = false;
-                mLaunchDoneCV.notify_one();
-                mWorkAvailableCV.notify_all();
+            if (finished == mNumTotalTasks) {
+                std::unique_lock<std::mutex> lock(mMutex);
+                mHasWork = false;
+                mCVDone.notify_one();
             }
         }
     }
@@ -315,26 +278,24 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_tota
         return;
     }
 
-    assert(runnable != nullptr);
-    if (runnable == nullptr) {
-        return;
-    }
-
-    std::lock_guard<std::mutex> run_lock(mRunMutex);
     {
-        std::lock_guard<std::mutex> lock(mMutex);
-        mCurrentRunnable = runnable;
-        mCurrentNumTotalTasks = num_total_tasks;
-        mNextTaskId = 0;
-        mCompletedTasks = 0;
-        mHasActiveRun = true;
-    }
-    mWorkAvailableCV.notify_all();
+        std::unique_lock<std::mutex> lock(mMutex);
 
-    std::unique_lock<std::mutex> lock(mMutex);
-    mLaunchDoneCV.wait(lock, [this]() {
-        return !mHasActiveRun;
-    });
+        mRunnable = runnable;
+        mNumTotalTasks = num_total_tasks;
+
+        mNextTask.store(0);
+        mFinishedTask.store(0);
+
+        mHasWork = true;
+    }
+
+    mCVWork.notify_all();
+
+    {
+        std::unique_lock<std::mutex> lock(mMutex);
+        mCVDone.wait(lock, [&]() { return !mHasWork; });
+    }
 }
 
 TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,

@@ -59,16 +59,13 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
         void sync();
     private:
         int mNumThreads;
-        std::vector<std::thread> mThreads;
-        std::atomic<IRunnable*> mCurrentRunnable;
-        std::atomic<int> mCurrentNumTotalTasks;
-        std::atomic<int> mNextTaskId;
-        std::atomic<int> mCompletedTasks;
-        std::atomic<int> mIdleWorkers;
-        std::atomic<bool> mHasActiveRun;
+        std::vector<std::thread> mWorkers;
         std::atomic<bool> mShutdown;
-        std::mutex mRunMutex;
-
+        std::atomic<int> mNextTask;
+        std::atomic<int> mFinishedTask;
+        std::atomic<bool> mHasWork;
+        IRunnable* mRunnable;
+        int mNumTotalTasks;
         void workerLoop();
 };
 
@@ -89,19 +86,19 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         void sync();
     private:
         int mNumThreads;
-        std::vector<std::thread> mThreads;
-        IRunnable* mCurrentRunnable;
-        int mCurrentNumTotalTasks;
-        int mNextTaskId;
-        int mCompletedTasks;
-        bool mHasActiveRun;
-        bool mShutdown;
+        std::vector<std::thread> mWorkers;
+        std::atomic<bool> mShutdown;
+        std::atomic<int> mNextTask;
+        std::atomic<int> mFinishedTask;
+        IRunnable* mRunnable;
+        int mNumTotalTasks;
+        bool mHasWork;
         std::mutex mMutex;
-        std::condition_variable mWorkAvailableCV;
-        std::condition_variable mLaunchDoneCV;
-        std::mutex mRunMutex;
+        std::condition_variable mCVWork;
+        std::condition_variable mCVDone;
 
         void workerLoop();
+
 };
 
 #endif
