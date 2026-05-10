@@ -2,7 +2,11 @@
 #define _TASKSYS_H
 
 #include "itasksys.h"
-
+#include <thread>
+#include <vector>
+#include <condition_variable>
+#include <mutex>
+#include <atomic>
 /*
  * TaskSystemSerial: This class is the student's implementation of a
  * serial task execution engine.  See definition of ITaskSystem in
@@ -25,7 +29,7 @@ class TaskSystemSerial: public ITaskSystem {
  * call.  See definition of ITaskSystem in itasksys.h for documentation
  * of the ITaskSystem interface.
  */
-class TaskSystemParallelSpawn: public ITaskSystem {
+class TaskSystemParallelSpawn: public ITaskSystem {        
     public:
         TaskSystemParallelSpawn(int num_threads);
         ~TaskSystemParallelSpawn();
@@ -34,6 +38,8 @@ class TaskSystemParallelSpawn: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+    private:
+        int mNumThreads;
 };
 
 /*
@@ -51,6 +57,19 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+    private:
+        int mNumThreads;
+        std::vector<std::thread> mThreads;
+        std::atomic<IRunnable*> mCurrentRunnable;
+        std::atomic<int> mCurrentNumTotalTasks;
+        std::atomic<int> mNextTaskId;
+        std::atomic<int> mCompletedTasks;
+        std::atomic<int> mIdleWorkers;
+        std::atomic<bool> mHasActiveRun;
+        std::atomic<bool> mShutdown;
+        std::mutex mRunMutex;
+
+        void workerLoop();
 };
 
 /*
@@ -68,6 +87,21 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+    private:
+        int mNumThreads;
+        std::vector<std::thread> mThreads;
+        IRunnable* mCurrentRunnable;
+        int mCurrentNumTotalTasks;
+        int mNextTaskId;
+        int mCompletedTasks;
+        bool mHasActiveRun;
+        bool mShutdown;
+        std::mutex mMutex;
+        std::condition_variable mWorkAvailableCV;
+        std::condition_variable mLaunchDoneCV;
+        std::mutex mRunMutex;
+
+        void workerLoop();
 };
 
 #endif
