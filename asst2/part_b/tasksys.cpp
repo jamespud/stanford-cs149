@@ -1,6 +1,5 @@
 #include "tasksys.h"
 #include <algorithm>
-#include <cstdio>
 
 
 IRunnable::~IRunnable() {}
@@ -164,16 +163,12 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
                                                               int num_total_tasks,
                                                               const std::vector<TaskID>& deps) {
     TaskID taskId = mTaskIdgen.fetch_add(1);
-    printf("[LAUNCH] runAsyncWithDeps called, launchId=%d, num_tasks=%d, deps.size()=%zu\n",
-           taskId, num_total_tasks, deps.size());
     TaskInfo taskInfo{taskId, runnable, num_total_tasks, deps};
     {
         std::unique_lock<std::mutex> lock(mMutex);
         if (deps.empty()) {
-            printf("[LAUNCH] No deps, adding to runnable tasks\n");
             mRunnableTasks.push_back(taskInfo);
         } else {
-            // check deps is done or not
             bool allDepsDone = true;
             for (TaskID dep : deps) {
                 if (mAllTasks.find(dep) != mAllTasks.end()) {
@@ -182,78 +177,63 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
                 }
             }
             if (allDepsDone) {
-                printf("[LAUNCH] All deps done, adding to runnable tasks\n");
                 mRunnableTasks.push_back(taskInfo);
             } else {
-                printf("[LAUNCH] Adding to waiting tasks\n");
                 mWaitingTasks.push_back(taskInfo);
             }
         }
         mAllTasks.insert(taskId);
-        printf("[LAUNCH] After insert, mAllTasks.size()=%zu, mRunnable=%p\n",
-               mAllTasks.size(), mRunnable);
         if (!mHasActiveTask.load()) {
-            printf("[LAUNCH] No current task, calling runNewTask()\n");
             runNewTask();
         }
     }
-    mCVWork.notify_all();
     return taskId;
 }
 
 void TaskSystemParallelThreadPoolSleeping::sync() {
-    printf("[SYNC] Entering sync(), mAllTasks.size()=%zu\n", mAllTasks.size());
-        {
-            std::unique_lock<std::mutex> lock(mMutex);
+    {
+        std::unique_lock<std::mutex> lock(mMutex);
 
-            printf("[SYNC] Waiting for mAllTasks to be empty, current size=%zu\n", mAllTasks.size());
-            mCVWork.wait(lock, [&]() { return mAllTasks.empty() || mShutdown.load(); });
+        mCVDone.wait(lock, [&]() { return mAllTasks.empty() || mShutdown.load(); });
 
-            printf("[SYNC] Woke up, mAllTasks.size()=%zu, shutdown=%d\n", mAllTasks.size(), mShutdown.load());
-            if (mShutdown.load()) {
-                return;
-            }
-           
+        if (mShutdown.load()) {
+            return;
         }
-    
-    printf("[SYNC] Exiting sync()\n");
+    }
 }
 
 void TaskSystemParallelThreadPoolSleeping::workerLoop() {
-    printf("[WORKER] Worker thread started\n");
-    int taskId = -1;
+    TaskID lastSeenTaskId = -1;
     while (true) {
         {
             std::unique_lock<std::mutex> lock(mMutex);
 
-            printf("[WORKER] Waiting for work, =%zu\n", mRunnableTasks.size());
-            mCVWork.wait(lock, [&]() { return mHasActiveTask.load() || mShutdown.load(); });
+            mCVWork.wait(lock, [&]() {
+                return mShutdown.load() ||
+                       (mHasActiveTask.load() && mCurrentTask.taskId != lastSeenTaskId);
+            });
 
             if (mShutdown.load()) {
-                printf("[WORKER] Worker shutting down\n");
                 return;
             }
+
+            lastSeenTaskId = mCurrentTask.taskId;
         }
 
-        printf("[WORKER] Starting task execution loop\n");
         while (true) {
-            taskId = mNextTask.fetch_add(1);
+            int taskId = mNextTask.fetch_add(1);
 
             if (taskId >= mNumTotalTasks.load()) {
-                printf("[WORKER] Task %d >= total %d, breaking\n", taskId, mNumTotalTasks.load());
                 break;
             }
 
             mRunnable->runTask(taskId, mNumTotalTasks.load());
 
             int finished = mFinishedTask.fetch_add(1) + 1;
-            printf("[WORKER] Task %d finished, total finished=%d/%d\n", taskId, finished, mNumTotalTasks.load());
             if (finished == mNumTotalTasks.load()) {
-                printf("[WORKER] All tasks done, calling activateTasks for launch %d\n", mCurrentTask.taskId);
                 std::unique_lock<std::mutex> lock(mMutex);
                 mAllTasks.erase(mCurrentTask.taskId);
                 mHasActiveTask.store(false);
-                printf("[WORKER] After erase, mAllTasks.size()=%zu\n", mAllTasks.size());
                 activateTasks(mCurrentTask.taskId);
             }
         }
@@ -264,37 +244,30 @@ void TaskSystemParallelThreadPoolSleeping::workerLoop() {
 
 // must be called with mMutex locked
 void TaskSystemParallelThreadPoolSleeping::activateTasks(TaskID finishedTaskId) {
-    printf("[ACTIVATE] activateTasks called for finished launch %d, mWaitingTasks.size()=%zu, mRunnableTasks.size()=%zu\n",
-           finishedTaskId, mWaitingTasks.size(), mRunnableTasks.size());
     for (auto task = mWaitingTasks.begin(); task != mWaitingTasks.end();) {
         auto index = std::find(task->deps.begin(), task->deps.end(), finishedTaskId);
         if (index != task->deps.end()) {
             task->deps.erase(index);
         }
         if (task->deps.empty()) {
-            printf("[ACTIVATE] Moving launch %d from waiting to runnable\n", task->taskId);
             mRunnableTasks.push_back(*task);
             task = mWaitingTasks.erase(task);
         } else {
             task++;
         }
     }
-    printf("[ACTIVATE] After processing, mAllTasks.size()=%zu, mRunnableTasks.size()=%zu\n",
-           mAllTasks.size(), mRunnableTasks.size());
     if (!mRunnableTasks.empty()) {
-        printf("[ACTIVATE] Calling runNewTask()\n");
         runNewTask();
     } else {
-        printf("[ACTIVATE] mAllTasks is empty, notifying all\n");
-        mCVWork.notify_all();
+        if (mAllTasks.empty()) {
+            mCVDone.notify_all();
+        }
     }
 }
 
 // must be called with mMutex locked
 void TaskSystemParallelThreadPoolSleeping::runNewTask() {
-    printf("[RUNNEW] runNewTask called, mRunnableTasks.size()=%zu\n", mRunnableTasks.size());
     if (mRunnableTasks.empty()) {
-        printf("[RUNNEW] No runnable tasks, returning\n");
         return;
     }
 
@@ -306,6 +279,5 @@ void TaskSystemParallelThreadPoolSleeping::runNewTask() {
     mNextTask.store(0);
     mFinishedTask.store(0);
     mHasActiveTask.store(true);
-    printf("[RUNNEW] Loaded launch %d with %d tasks, notifying workers\n", task.taskId, task.num_total_tasks);
     mCVWork.notify_all();
 }

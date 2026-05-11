@@ -95,14 +95,14 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         std::atomic<int> mTaskIdgen;
         
         IRunnable* mRunnable;
-        TaskInfo mCurrentTask;
+        TaskInfo mCurrentTask{};
         std::atomic<bool> mHasActiveTask;
         std::atomic<int> mNextTask;
         std::atomic<int> mNumTotalTasks;
         std::atomic<int> mFinishedTask;
         
         std::condition_variable mCVWork;
-        // std::condition_variable mCVAddTask;
+        std::condition_variable mCVDone;
         
         void workerLoop();
         void activateTasks(TaskID finishedTaskId);
