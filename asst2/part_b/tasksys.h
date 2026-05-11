@@ -2,6 +2,13 @@
 #define _TASKSYS_H
 
 #include "itasksys.h"
+#include <thread>
+#include <vector>
+#include <condition_variable>
+#include <mutex>
+#include <atomic>
+#include <set>
+#include <map>
 
 /*
  * TaskSystemSerial: This class is the student's implementation of a
@@ -53,6 +60,13 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
         void sync();
 };
 
+struct TaskInfo{
+    TaskID taskId;
+    IRunnable* runnable;
+    int num_total_tasks;
+    std::vector<TaskID> deps;
+};
+
 /*
  * TaskSystemParallelThreadPoolSleeping: This class is the student's
  * optimized implementation of a parallel task execution engine that uses
@@ -68,6 +82,31 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+    private:
+        int mNumThreads;
+        std::vector<std::thread> mWorkers;
+
+        std::mutex mMutex;
+        std::vector<TaskInfo> mRunnableTasks;
+        std::vector<TaskInfo> mWaitingTasks;
+        // std::set<TaskInfo> mFinishedTasks;
+        std::set<TaskID> mAllTasks;
+        std::atomic<bool> mShutdown;
+        std::atomic<int> mTaskIdgen;
+        
+        IRunnable* mRunnable;
+        TaskInfo mCurrentTask;
+        std::atomic<bool> mHasActiveTask;
+        std::atomic<int> mNextTask;
+        std::atomic<int> mNumTotalTasks;
+        std::atomic<int> mFinishedTask;
+        
+        std::condition_variable mCVWork;
+        // std::condition_variable mCVAddTask;
+        
+        void workerLoop();
+        void activateTasks(TaskID finishedTaskId);
+        void runNewTask();
 };
 
 #endif
