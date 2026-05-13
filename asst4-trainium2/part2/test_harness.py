@@ -12,6 +12,7 @@ from conv2d import fused_conv2d_maxpool as conv2d
 from conv2d_numpy import conv2d_cpu_torch
 import logging
 import argparse
+import sys
 
 import subprocess
 
@@ -239,6 +240,13 @@ if __name__ == "__main__":
     if correctness_score < 2.5 * len(correctness_tests):
         print("Correctness failed, skipping performance tests.")
         exit()
+
+    if args.simulate:
+        print("\nSimulation mode only validates correctness on the local CPU; skipping performance and extra credit benchmarks.")
+        print(
+            f"Correctness: {correctness_score}\tTotal obtainable: {10.0 if args.test_maxpool else 7.5}"
+        )
+        sys.exit(0)
     
     # --------- PERFORMANCE TESTS ---------
     performance_tests = [

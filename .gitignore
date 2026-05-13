@@ -1,1 +1,4 @@
 .vscode
+nki_env/
+ispc-*
+__pycache__/
