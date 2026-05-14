@@ -65,14 +65,75 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     )
 
     # Various tiling dimensions (You may want to define more of them)
-    c_in_pmax = nl.tile_size.pmax
-    n_tiles_c_in = in_channels // c_in_pmax
+    channel_tile = nl.tile_size.pmax
+    n_tiles_c_in = in_channels // channel_tile
+    n_tiles_c_out = out_channels // channel_tile
+
 
     # Process the images in batches
     for b in nl.affine_range(batch_size):
-        raise RuntimeError("Please fill your implementation of computing convolution"
-                           " of X[b] with the weights W and bias b, followed by a"
-                           " maxpool and store the result in X_out[b]")
+        for oc in nl.affine_range(n_tiles_c_out):
+
+            oc_start = oc * channel_tile
+
+            bias_tile = nl.ndarray(
+                shape=(channel_tile, 1),
+                dtype=nl.float32,
+                buffer=nl.sbuf,
+            )
+            nisa.dma_copy(dst=bias_tile, src=bias[oc_start : oc_start + channel_tile])
+
+            for oh in nl.affine_range(out_height):
+                conv_psum = nl.zeros((channel_tile, out_width), dtype=nl.float32, buffer=nl.psum)
+
+                for fh in nl.affine_range(filter_height):
+                    for fw in nl.affine_range(filter_width):
+                        for ic in nl.affine_range(in_channels // channel_tile):
+                            ic_start = ic * channel_tile
+
+                            X_tile = nl.ndarray(
+                                shape=(channel_tile, out_width),
+                                dtype=X.dtype,
+                                buffer=nl.sbuf
+                            )
+                            W_tile = nl.ndarray(
+                                shape=(channel_tile, channel_tile),
+                                dtype=W.dtype,
+                                buffer=nl.sbuf
+                            )
+                            stationary_tile = nl.ndarray(
+                                shape=(channel_tile, channel_tile),
+                                dtype=W.dtype,
+                                buffer=nl.sbuf,
+                            )
+
+                            nisa.dma_copy(dst=X_tile,
+                                          src=X[b,
+                                                ic_start : ic_start + channel_tile,
+                                                oh + fh,
+                                                fw : fw + out_width]
+                            )
+                            nisa.dma_copy(dst=W_tile,
+                                          src=W[oc_start : oc_start + channel_tile,
+                                                ic_start : ic_start + channel_tile,
+                                                fh,
+                                                fw]
+                            )
+
+                            stationary_tile[...] = nisa.tensor_copy(src=nisa.nc_transpose(W_tile))
+
+                            conv_psum += nisa.nc_matmul(stationary_tile[...], X_tile[...])
+
+                conv_row = nl.copy(conv_psum, dtype=nl.float32)
+                conv_row = nisa.tensor_scalar(conv_row, nl.add, bias_tile)
+                conv_row = nl.copy(conv_row, dtype=X.dtype)
+
+                nisa.dma_copy(dst=X_out[b,
+                                        oc_start : oc_start + channel_tile,
+                                        oh,
+                                        0 : out_pool_width],
+                              src=conv_row)
+
 
     return X_out
 
