@@ -19,43 +19,36 @@
 //
 __global__ void kernel(uint8_t* data, int* out, int num_bins, int num_channels, int length) {
     extern __shared__ int local_shared[];
-    __shared__ uint8_t local_data[BLOCK_SIZE][BLOCK_SIZE];
 
-    int base_idx = blockIdx.y * blockDim.y;
-    int base_jdy = blockIdx.x * blockDim.x;
+    int global_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int global_jdx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    int local_idx = threadIdx.y;
-    int local_jdx = threadIdx.x;
+    int linear_tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int total_threads = blockDim.x * blockDim.y;
+    int shared_size = blockDim.x * num_bins;
 
-    int global_idx = base_idx + local_idx;
-    int global_jdx = base_jdy + local_jdx;
-
-    if (global_idx < length && global_jdx < num_channels) {
-        local_data[local_idx][local_jdx] = data[global_idx * num_channels + global_jdx];
-    } else {
-        local_data[local_idx][local_jdx] = 0;
+    for (int i = linear_tid; i < shared_size; i += total_threads) {
+        local_shared[i] = 0;
     }
-    __syncthreads();
-
-    if (local_jdx == 0) {
-        for (int i = 0; i < num_bins; i++) {
-            local_shared[local_idx * num_bins + i] = 0;
-        }
-    }
-
     __syncthreads();
 
     if (global_idx < length && global_jdx < num_channels) {
-        int bin = local_data[local_idx][local_jdx];
-        atomicAdd(&local_shared[local_jdx * num_bins + bin], 1);
+        uint8_t val = data[global_idx * num_channels + global_jdx];
+        atomicAdd(&local_shared[threadIdx.x * num_bins + val], 1);
     }
     __syncthreads();
 
-    if (local_idx == 0) {
-        for (int j = 0; j < num_bins; j++) {
-            int count = local_shared[local_jdx * num_bins + j];
-            if (count > 0) {
-                atomicAdd(&out[global_jdx * num_bins + j], count);
+    int base_global_channel = blockIdx.x * blockDim.x;
+
+    for (int i = linear_tid; i < shared_size; i += total_threads) {
+        int count = local_shared[i];
+        if (count > 0) {
+            int local_ch = i / num_bins;
+            int bin = i % num_bins;
+            int global_ch = base_global_channel + local_ch;
+
+            if (global_ch < num_channels) {
+                atomicAdd(&out[global_ch * num_bins + bin], count);
             }
         }
     }
