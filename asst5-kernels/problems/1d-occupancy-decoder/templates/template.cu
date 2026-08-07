@@ -1,287 +1,358 @@
-// Template for OneDOccupancyDecoder CUDA Kernel Submission
+// OneDOccupancyDecoder - optimized CUDA implementation.
 //
-// This file shows the expected signature for your CUDA implementation.
-// You must implement the kernel_body and custom_kernel functions below.
+// Structure
+//  1. Query MLP, K/V projections and the final output projection run as fp16
+//     GEMMs (cuBLAS through torch ops) - the same building blocks the PyTorch
+//     baseline uses.
+//  2. The cross-attention is a custom flash-attention style kernel using
+//     tensor cores (WMMA): each block owns kBM queries of one head and streams
+//     that head's K/V through shared memory in chunks, maintaining a running
+//     (fp32) max and sum so softmax is done in a single pass.
+//  3. LayerNorm + output projection are fused into one lightweight kernel.
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <mma.h>
 #include <torch/extension.h>
 
 #include <cmath>
 #include <stdexcept>
 
+using namespace nvcuda;
+
+namespace {
+
 constexpr int kNumHeads = 12;
 constexpr int kHeadDim = 64;
-constexpr int kWidth = kNumHeads * kHeadDim;
-constexpr int kNumLatents = 1024;
-constexpr int kWarpSize = 32;
+constexpr int kWidth = 768;
+constexpr int kBM = 128;   // queries per block
+constexpr int kBK = 128;   // latents processed per iteration
+constexpr int kWarps = kBM / 16;  // 8 warps per block
+constexpr int kLanes = 32;
+// Head-dim rows padded so every WMMA tile pointer stays 16-byte aligned and
+// shared-memory bank conflicts are reduced.
+constexpr int kVStride = 72;
 constexpr float kLayerNormEps = 1e-6f;
+constexpr float kAttnScale = 0.125f;  // 1 / sqrt(64)
 
-template <typename input_t, typename weight_t, typename output_t>
-__device__ void linear_layer_forward_strided(const input_t* vec_in,
-                                             const weight_t* weight,
-                                             const weight_t* bias, output_t* vec_out,
-                                             int in_dim, int out_dim, bool apply_silu,
-                                             int thread_id, int num_threads) {
-    for (int out_idx = thread_id; out_idx < out_dim; out_idx += num_threads) {
-        float sum = static_cast<float>(bias[out_idx]);
-        for (int in_idx = 0; in_idx < in_dim; ++in_idx) {
-            sum += static_cast<float>(vec_in[in_idx]) *
-                   static_cast<float>(weight[out_idx * in_dim + in_idx]);
-        }
-        if (apply_silu) {
-            sum = sum / (1.0f + expf(-sum));
-        }
-        vec_out[out_idx] = static_cast<output_t>(sum);
-    }
+// Cooperative load of K/V chunk `chunk` (kBK latents) into shared memory.
+// Both Ks and Vs are stored row-major as [latent][head_dim + pad].
+__device__ __forceinline__ void load_kv_chunk(
+    const half* __restrict__ k, const half* __restrict__ v, half* __restrict__ Ks,
+    half* __restrict__ Vs, int batch, int head, int chunk, int num_latents,
+    int tid, int nthreads) {
+  const int s0 = chunk * kBK;
+  for (int i = tid; i < kBK * kHeadDim; i += nthreads) {
+    const int s = i / kHeadDim;
+    const int d = i - s * kHeadDim;
+    const long long src = ((long long)batch * num_latents + s0 + s) * kWidth +
+                          head * kHeadDim + d;
+    Ks[s * kVStride + d] = k[src];
+    Vs[s * kVStride + d] = v[src];
+  }
 }
 
-__device__ __forceinline__ float warp_reduce_sum(float value) {
-    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-        value += __shfl_down_sync(0xffffffffu, value, offset);
+// Flash-attention style kernel.
+//
+// Grid:  (ceil(num_queries / kBM), num_heads, batch)
+// Block: (32, kWarps); each warp owns 16 query rows and computes all 64 head
+// dimensions of those rows for one head.
+__global__ void __launch_bounds__(kLanes * kWarps) attention_kernel(
+    const half* __restrict__ q, const half* __restrict__ k,
+    const half* __restrict__ v, half* __restrict__ out, int num_queries,
+    int num_latents) {
+  __shared__ __align__(16) half Ks[kBK * kVStride];
+  __shared__ __align__(16) half Vs[kBK * kVStride];
+
+  const int batch = blockIdx.z;
+  const int head = blockIdx.y;
+  const int q0 = blockIdx.x * kBM;
+  const int warp = threadIdx.y;
+  const int lane = threadIdx.x;
+
+  // Clamp the warp's first row into the valid range so out-of-bounds tiles are
+  // never read; rows >= num_queries are skipped at store time.
+  const int last_row = num_queries > 16 ? num_queries - 16 : 0;
+  const int qrow_base = (q0 + warp * 16 < last_row) ? (q0 + warp * 16) : last_row;
+
+  // This warp's Q rows (16 x 64), split into 4 k-chunks of 16.
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf[4];
+#pragma unroll
+  for (int c = 0; c < 4; ++c) {
+    const half* qptr = q + ((long long)batch * num_queries + qrow_base) * kWidth +
+                       head * kHeadDim + c * 16;
+    wmma::load_matrix_sync(qf[c], qptr, kWidth);
+  }
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> o_frag[4];
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+    wmma::fill_fragment(o_frag[t], 0.0f);
+  }
+
+  // Running softmax state; one entry per fragment row group (rows g and g+8).
+  float m[2] = {-1e30f, -1e30f};
+  float l[2] = {0.0f, 0.0f};
+
+  const int tid = warp * kLanes + lane;
+  const int nthreads = blockDim.y * kLanes;
+  const int num_chunks = num_latents / kBK;
+
+  load_kv_chunk(k, v, Ks, Vs, batch, head, 0, num_latents, tid, nthreads);
+  __syncthreads();
+
+  for (int c = 0; c < num_chunks; ++c) {
+    // ---- QK^T: S[16, 128] in 8 accumulator tiles ----
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[8];
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+      wmma::fill_fragment(acc[t], 0.0f);
     }
-    return value;
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+#pragma unroll
+      for (int st = 0; st < 8; ++st) {
+        // B[k=dim][n=latent] = Ks[latent][dim] stored row-major -> col-major B.
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kf;
+        const half* kptr = Ks + st * 16 * kVStride + kk * 16;
+        wmma::load_matrix_sync(kf, kptr, kVStride);
+        wmma::mma_sync(acc[st], qf[kk], kf, acc[st]);
+      }
+    }
+
+    // ---- Online softmax in fp32 ----
+    // acc element e lives in row g for e in {0,1,4,5} and row g+8 for e in
+    // {2,3,6,7} (verified empirically), where g = lane / 4.
+    float rmax[2] = {-1e30f, -1e30f};
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const float s = acc[t].x[e] * kAttnScale;
+        acc[t].x[e] = s;
+        rmax[(e >> 1) & 1] = fmaxf(rmax[(e >> 1) & 1], s);
+      }
+    }
+    // The 4 lanes with the same lane % 4 share a row: reduce with xor shuffles.
+#pragma unroll
+    for (int o = 1; o <= 2; o <<= 1) {
+      rmax[0] = fmaxf(rmax[0], __shfl_xor_sync(0xffffffffu, rmax[0], o));
+      rmax[1] = fmaxf(rmax[1], __shfl_xor_sync(0xffffffffu, rmax[1], o));
+    }
+    const float m_new0 = fmaxf(rmax[0], m[0]);
+    const float m_new1 = fmaxf(rmax[1], m[1]);
+    const float a0 = __expf(m[0] - m_new0);
+    const float a1 = __expf(m[1] - m_new1);
+
+    // Rescale O and l when the running max increases.
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        o_frag[t].x[e] *= ((e >> 1) & 1) ? a1 : a0;
+      }
+    }
+
+    // P = exp(S - m_new); the matrix_a fragment shares acc's element layout,
+    // so a straight conversion produces the P tile for the PV matmul.
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf[8];
+    float lsum[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const float p =
+            __expf(acc[t].x[e] - (((e >> 1) & 1) ? m_new1 : m_new0));
+        pf[t].x[e] = __float2half(p);
+        lsum[(e >> 1) & 1] += p;
+      }
+    }
+#pragma unroll
+    for (int o = 1; o <= 2; o <<= 1) {
+      lsum[0] += __shfl_xor_sync(0xffffffffu, lsum[0], o);
+      lsum[1] += __shfl_xor_sync(0xffffffffu, lsum[1], o);
+    }
+    l[0] = l[0] * a0 + lsum[0];
+    l[1] = l[1] * a1 + lsum[1];
+    m[0] = m_new0;
+    m[1] = m_new1;
+
+    // ---- PV: O += P @ V ----
+#pragma unroll
+    for (int vt = 0; vt < 4; ++vt) {
+#pragma unroll
+      for (int st = 0; st < 8; ++st) {
+        // B[k=latent][n=dim] = Vs[latent][dim] stored row-major -> row-major B.
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
+        const half* vptr = Vs + st * 16 * kVStride + vt * 16;
+        wmma::load_matrix_sync(vf, vptr, kVStride);
+        wmma::mma_sync(o_frag[vt], pf[st], vf, o_frag[vt]);
+      }
+    }
+
+    // All warps are done reading this chunk: stage the next one.
+    __syncthreads();
+    if (c + 1 < num_chunks) {
+      load_kv_chunk(k, v, Ks, Vs, batch, head, c + 1, num_latents, tid, nthreads);
+    }
+    __syncthreads();
+  }
+
+  // ---- Epilogue: divide by the running row sums, store fp16 ----
+  const float inv_l0 = 1.0f / fmaxf(l[0], 1e-20f);
+  const float inv_l1 = 1.0f / fmaxf(l[1], 1e-20f);
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      o_frag[t].x[e] *= ((e >> 1) & 1) ? inv_l1 : inv_l0;
+    }
+  }
+
+  const int g = lane >> 2;
+  const int t4 = lane & 3;
+#pragma unroll
+  for (int vt = 0; vt < 4; ++vt) {
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const int row = qrow_base + g + 8 * ((e >> 1) & 1);
+      if (row < num_queries) {
+        const int col = head * kHeadDim + vt * 16 + 2 * t4 + (e & 1) +
+                        ((e >> 2) ? 8 : 0);
+        half* optr = out + ((long long)batch * num_queries + row) * kWidth + col;
+        *optr = __float2half(o_frag[vt].x[e]);
+      }
+    }
+  }
 }
 
-__device__ __forceinline__ float warp_reduce_max(float value) {
-    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-        value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, offset));
-    }
-    return value;
+// LayerNorm (elementwise_affine=False, eps=1e-6) fused with the final
+// projection: out = out_proj_weight @ LN(x) + out_proj_bias.
+// One warp per query row; 8 rows per block.
+__global__ void __launch_bounds__(kLanes * 8) ln_outproj_kernel(
+    const half* __restrict__ x, const half* __restrict__ weight,
+    const half* __restrict__ bias, half* __restrict__ out, int num_queries) {
+  const int row = blockIdx.x * blockDim.y + threadIdx.y;
+  const int lane = threadIdx.x;
+  if (row >= num_queries) {
+    return;
+  }
+
+  const half* xr = x + ((long long)blockIdx.z * num_queries + row) * kWidth;
+  const half2* xr2 = reinterpret_cast<const half2*>(xr);
+  const half2* wr2 = reinterpret_cast<const half2*>(weight);
+
+  float sum = 0.0f;
+  float sumsq = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kWidth / 2 / kLanes; ++i) {
+    const float2 f = __half22float2(xr2[i * kLanes + lane]);
+    sum += f.x + f.y;
+    sumsq += f.x * f.x + f.y * f.y;
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    sumsq += __shfl_xor_sync(0xffffffffu, sumsq, o);
+  }
+
+  const float mean = sum / kWidth;
+  float var = sumsq / kWidth - mean * mean;
+  var = fmaxf(var, 0.0f);
+  const float inv_std = rsqrtf(var + kLayerNormEps);
+
+  float dot = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kWidth / 2 / kLanes; ++i) {
+    const float2 f = __half22float2(xr2[i * kLanes + lane]);
+    const float2 wv = __half22float2(wr2[i * kLanes + lane]);
+    dot += (f.x - mean) * inv_std * wv.x + (f.y - mean) * inv_std * wv.y;
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    dot += __shfl_down_sync(0xffffffffu, dot, o);
+  }
+  if (lane == 0) {
+    out[(long long)blockIdx.z * num_queries + row] =
+        __float2half(__half2float(bias[0]) + dot);
+  }
 }
 
-template <typename scalar_t>
-__global__ void precompute_kv_kernel(
-    const scalar_t* __restrict__ latents, const scalar_t* __restrict__ attn_c_k_weight,
-    const scalar_t* __restrict__ attn_c_k_bias, const scalar_t* __restrict__ attn_c_v_weight,
-    const scalar_t* __restrict__ attn_c_v_bias, scalar_t* __restrict__ k_cache,
-    scalar_t* __restrict__ v_cache, int64_t batch_size, int64_t num_latents, int64_t width) {
-    int batch_idx = blockIdx.y;
-    int latent_idx = blockIdx.x;
+}  // namespace
 
-    if (batch_idx >= batch_size || latent_idx >= num_latents) {
-        return;
-    }
-
-    int thread_id = threadIdx.y * blockDim.x + threadIdx.x;
-    int num_threads = blockDim.x * blockDim.y;
-
-    const int64_t latent_offset = (batch_idx * num_latents + latent_idx) * width;
-    const scalar_t* latent_row = latents + latent_offset;
-    scalar_t* k_row = k_cache + latent_offset;
-    scalar_t* v_row = v_cache + latent_offset;
-
-    linear_layer_forward_strided(latent_row, attn_c_k_weight, attn_c_k_bias, k_row,
-                                 static_cast<int>(width), static_cast<int>(width), false,
-                                 thread_id, num_threads);
-    linear_layer_forward_strided(latent_row, attn_c_v_weight, attn_c_v_bias, v_row,
-                                 static_cast<int>(width), static_cast<int>(width), false,
-                                 thread_id, num_threads);
-}
-
-template <typename scalar_t>
-__global__ void kernel_body(
-    const scalar_t* __restrict__ queries, const scalar_t* __restrict__ k_cache,
-    const scalar_t* __restrict__ v_cache,
-    const scalar_t* __restrict__ query_in_in_layer_weight,
-    const scalar_t* __restrict__ query_in_in_layer_bias,
-    const scalar_t* __restrict__ query_in_out_layer_weight,
-    const scalar_t* __restrict__ query_in_out_layer_bias,
-    const scalar_t* __restrict__ attn_c_q_weight, const scalar_t* __restrict__ attn_c_q_bias,
-    const scalar_t* __restrict__ attn_c_proj_weight,
-    const scalar_t* __restrict__ attn_c_proj_bias, const scalar_t* __restrict__ out_proj_weight,
-    const scalar_t* __restrict__ out_proj_bias, scalar_t* __restrict__ output,
-    scalar_t* __restrict__ intermediate, int64_t batch_size, int64_t num_queries,
-    int64_t num_latents, int64_t q_in_dim, int64_t width, int64_t num_heads) {
-    int batch_idx = blockIdx.y;
-    int query_idx = blockIdx.x;
-    int head_idx = threadIdx.y;
-    int lane = threadIdx.x;
-
-    if (batch_idx >= batch_size || query_idx >= num_queries || head_idx >= num_heads) {
-        return;
-    }
-
-    int thread_id = threadIdx.y * blockDim.x + threadIdx.x;
-    int num_threads = blockDim.x * blockDim.y;
-    int head_dim = static_cast<int>(width / num_heads);
-    float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-
-    __shared__ float q_buf0[kWidth];
-    __shared__ float q_buf1[kWidth];
-    __shared__ float attn_buf[kWidth];
-    __shared__ float proj_buf[kWidth];
-
-    const int64_t query_offset = (batch_idx * num_queries + query_idx) * q_in_dim;
-    const scalar_t* query_row = queries + query_offset;
-
-    linear_layer_forward_strided(query_row, query_in_in_layer_weight, query_in_in_layer_bias,
-                                 q_buf0, static_cast<int>(q_in_dim), static_cast<int>(width),
-                                 true, thread_id, num_threads);
-    __syncthreads();
-
-    linear_layer_forward_strided(q_buf0, query_in_out_layer_weight, query_in_out_layer_bias,
-                                 q_buf1, static_cast<int>(width), static_cast<int>(width),
-                                 false, thread_id, num_threads);
-    __syncthreads();
-
-    linear_layer_forward_strided(q_buf1, attn_c_q_weight, attn_c_q_bias, q_buf0,
-                                 static_cast<int>(width), static_cast<int>(width), false,
-                                 thread_id, num_threads);
-    __syncthreads();
-
-    const int head_start = head_idx * head_dim;
-    float max_score = -INFINITY;
-
-    // First pass: compute max score for stable softmax
-    for (int latent_idx = 0; latent_idx < num_latents; ++latent_idx) {
-        const int64_t latent_offset = (batch_idx * num_latents + latent_idx) * width + head_start;
-        float partial = 0.0f;
-        partial += q_buf0[head_start + lane] * static_cast<float>(k_cache[latent_offset + lane]);
-        partial += q_buf0[head_start + lane + kWarpSize] *
-                   static_cast<float>(k_cache[latent_offset + lane + kWarpSize]);
-        float score = warp_reduce_sum(partial);
-        if (lane == 0) {
-            max_score = fmaxf(max_score, score * scale);
-        }
-    }
-    max_score = __shfl_sync(0xffffffffu, max_score, 0);
-
-    // Second pass: compute sum of exponents
-    float sum_exp = 0.0f;
-    for (int latent_idx = 0; latent_idx < num_latents; ++latent_idx) {
-        const int64_t latent_offset = (batch_idx * num_latents + latent_idx) * width + head_start;
-        float partial = 0.0f;
-        partial += q_buf0[head_start + lane] * static_cast<float>(k_cache[latent_offset + lane]);
-        partial += q_buf0[head_start + lane + kWarpSize] *
-                   static_cast<float>(k_cache[latent_offset + lane + kWarpSize]);
-        float score = warp_reduce_sum(partial);
-        if (lane == 0) {
-            sum_exp += expf(score * scale - max_score);
-        }
-    }
-    sum_exp = __shfl_sync(0xffffffffu, sum_exp, 0);
-    sum_exp = fmaxf(sum_exp, 1e-20f);
-
-    // Third pass: compute weighted sum of V values
-    float out0 = 0.0f;
-    float out1 = 0.0f;
-    for (int latent_idx = 0; latent_idx < num_latents; ++latent_idx) {
-        const int64_t latent_offset = (batch_idx * num_latents + latent_idx) * width + head_start;
-        float partial = 0.0f;
-        partial += q_buf0[head_start + lane] * static_cast<float>(k_cache[latent_offset + lane]);
-        partial += q_buf0[head_start + lane + kWarpSize] *
-                   static_cast<float>(k_cache[latent_offset + lane + kWarpSize]);
-        float score = warp_reduce_sum(partial);
-        float weight = 0.0f;
-        if (lane == 0) {
-            weight = expf(score * scale - max_score) / sum_exp;
-        }
-        weight = __shfl_sync(0xffffffffu, weight, 0);
-        out0 += weight * static_cast<float>(v_cache[latent_offset + lane]);
-        out1 += weight * static_cast<float>(v_cache[latent_offset + lane + kWarpSize]);
-    }
-
-    attn_buf[head_start + lane] = out0;
-    attn_buf[head_start + lane + kWarpSize] = out1;
-    __syncthreads();
-
-    linear_layer_forward_strided(attn_buf, attn_c_proj_weight, attn_c_proj_bias, proj_buf,
-                                 static_cast<int>(width), static_cast<int>(width), false,
-                                 thread_id, num_threads);
-    __syncthreads();
-
-    if (thread_id == 0) {
-        float mean = 0.0f;
-        for (int i = 0; i < width; ++i) {
-            mean += proj_buf[i];
-        }
-        mean /= static_cast<float>(width);
-
-        float var = 0.0f;
-        for (int i = 0; i < width; ++i) {
-            float diff = proj_buf[i] - mean;
-            var += diff * diff;
-        }
-        var /= static_cast<float>(width);
-
-        float inv_std = rsqrtf(var + kLayerNormEps);
-        const int64_t output_offset = (batch_idx * num_queries + query_idx) * width;
-        for (int i = 0; i < width; ++i) {
-            float norm = (proj_buf[i] - mean) * inv_std;
-            proj_buf[i] = norm;
-            intermediate[output_offset + i] = static_cast<scalar_t>(norm);
-        }
-
-        float final_sum = static_cast<float>(out_proj_bias[0]);
-        for (int i = 0; i < width; ++i) {
-            final_sum += proj_buf[i] * static_cast<float>(out_proj_weight[i]);
-        }
-
-        output[batch_idx * num_queries + query_idx] = static_cast<scalar_t>(final_sum);
-    }
-}
-
-// Required: Main function that will be called from Python
-// Signature must match the updated input_t format with all weights
 torch::Tensor custom_kernel(
-    torch::Tensor queries, torch::Tensor latents, torch::Tensor query_in_in_layer_weight,
-    torch::Tensor query_in_in_layer_bias, torch::Tensor query_in_out_layer_weight,
-    torch::Tensor query_in_out_layer_bias, torch::Tensor attn_c_q_weight,
-    torch::Tensor attn_c_q_bias, torch::Tensor attn_c_k_weight, torch::Tensor attn_c_k_bias,
-    torch::Tensor attn_c_v_weight, torch::Tensor attn_c_v_bias, torch::Tensor attn_c_proj_weight,
-    torch::Tensor attn_c_proj_bias, torch::Tensor out_proj_weight, torch::Tensor out_proj_bias) {
-    auto batch_size = queries.size(0);
-    auto num_queries = queries.size(1);
-    auto q_in_dim = queries.size(2);
-    auto num_latents = latents.size(1);
-    auto width = latents.size(2);
+    torch::Tensor queries, torch::Tensor latents,
+    torch::Tensor query_in_in_layer_weight, torch::Tensor query_in_in_layer_bias,
+    torch::Tensor query_in_out_layer_weight, torch::Tensor query_in_out_layer_bias,
+    torch::Tensor attn_c_q_weight, torch::Tensor attn_c_q_bias,
+    torch::Tensor attn_c_k_weight, torch::Tensor attn_c_k_bias,
+    torch::Tensor attn_c_v_weight, torch::Tensor attn_c_v_bias,
+    torch::Tensor attn_c_proj_weight, torch::Tensor attn_c_proj_bias,
+    torch::Tensor out_proj_weight, torch::Tensor out_proj_bias) {
+  TORCH_CHECK(queries.scalar_type() == torch::kHalf, "expected float16 inputs");
+  queries = queries.contiguous();
+  latents = latents.contiguous();
 
-    if (width != kWidth || num_latents != kNumLatents) {
-        throw std::runtime_error("This kernel expects width=768 and num_latents=1024.");
-    }
+  const int64_t batch = queries.size(0);
+  const int64_t num_queries = queries.size(1);
+  const int64_t num_latents = latents.size(1);
+  TORCH_CHECK(latents.size(2) == kWidth, "expected width 768");
+  TORCH_CHECK(num_latents % kBK == 0, "num_latents must be a multiple of kBK");
 
-    auto output = torch::empty({batch_size, num_queries, 1}, queries.options());
-    auto intermediate = torch::empty({batch_size, num_queries, width}, queries.options());
-    auto k_cache = torch::empty_like(latents);
-    auto v_cache = torch::empty_like(latents);
+  auto opts = queries.options();
+  auto queries2 = queries.reshape({batch * num_queries, queries.size(2)});
+  auto latents2 = latents.reshape({batch * num_latents, kWidth});
 
-    dim3 blockDim(kWarpSize, kNumHeads);
-    dim3 kvGrid(num_latents, batch_size);
-    dim3 queryGrid(num_queries, batch_size);
+  // Fold the two consecutive linear layers of the query MLP:
+  //   h1 = h0 @ W_out^T + b_out
+  //   q  = h1 @ W_q^T   + b_q
+  // => q  = h0 @ (W_q @ W_out)^T + (b_q + W_q @ b_out)
+  auto w_eff = torch::matmul(attn_c_q_weight, query_in_out_layer_weight);
+  auto b_eff =
+      torch::matmul(attn_c_q_weight, query_in_out_layer_bias) + attn_c_q_bias;
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(queries.scalar_type(), "precompute_kv_kernel", ([&] {
-        precompute_kv_kernel<scalar_t><<<kvGrid, blockDim>>>(
-            latents.data_ptr<scalar_t>(), attn_c_k_weight.data_ptr<scalar_t>(),
-            attn_c_k_bias.data_ptr<scalar_t>(), attn_c_v_weight.data_ptr<scalar_t>(),
-            attn_c_v_bias.data_ptr<scalar_t>(), k_cache.data_ptr<scalar_t>(),
-            v_cache.data_ptr<scalar_t>(), batch_size, num_latents, width);
-    }));
+  auto h0 = torch::silu(
+      torch::addmm(query_in_in_layer_bias, queries2, query_in_in_layer_weight.t()));
+  auto q = torch::addmm(b_eff, h0, w_eff.t())
+               .reshape({batch, num_queries, kWidth});
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        throw std::runtime_error(cudaGetErrorString(err));
-    }
+  auto k = torch::addmm(attn_c_k_bias, latents2, attn_c_k_weight.t())
+               .reshape({batch, num_latents, kWidth});
+  auto v = torch::addmm(attn_c_v_bias, latents2, attn_c_v_weight.t())
+               .reshape({batch, num_latents, kWidth});
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(queries.scalar_type(), "kernel_body", ([&] {
-        kernel_body<scalar_t><<<queryGrid, blockDim>>>(
-            queries.data_ptr<scalar_t>(), k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),
-            query_in_in_layer_weight.data_ptr<scalar_t>(),
-            query_in_in_layer_bias.data_ptr<scalar_t>(),
-            query_in_out_layer_weight.data_ptr<scalar_t>(),
-            query_in_out_layer_bias.data_ptr<scalar_t>(), attn_c_q_weight.data_ptr<scalar_t>(),
-            attn_c_q_bias.data_ptr<scalar_t>(), attn_c_proj_weight.data_ptr<scalar_t>(),
-            attn_c_proj_bias.data_ptr<scalar_t>(), out_proj_weight.data_ptr<scalar_t>(),
-            out_proj_bias.data_ptr<scalar_t>(), output.data_ptr<scalar_t>(),
-            intermediate.data_ptr<scalar_t>(), batch_size, num_queries, num_latents, q_in_dim,
-            width, kNumHeads);
-    }));
+  auto attn = torch::empty({batch, num_queries, kWidth}, opts);
+  dim3 block(kLanes, kWarps);
+  dim3 grid((num_queries + kBM - 1) / kBM, kNumHeads, batch);
+  attention_kernel<<<grid, block>>>(
+      reinterpret_cast<const half*>(q.data_ptr()),
+      reinterpret_cast<const half*>(k.data_ptr()),
+      reinterpret_cast<const half*>(v.data_ptr()),
+      reinterpret_cast<half*>(attn.data_ptr()), (int)num_queries,
+      (int)num_latents);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    throw std::runtime_error(cudaGetErrorString(err));
+  }
 
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        throw std::runtime_error(cudaGetErrorString(err));
-    }
+  auto cproj =
+      torch::addmm(attn_c_proj_bias,
+                   attn.reshape({batch * num_queries, kWidth}),
+                   attn_c_proj_weight.t())
+          .reshape({batch, num_queries, kWidth});
 
-    cudaDeviceSynchronize();
+  auto out = torch::empty({batch, num_queries, 1}, opts);
+  dim3 ln_block(kLanes, 8);
+  dim3 ln_grid((num_queries + 7) / 8, 1, batch);
+  ln_outproj_kernel<<<ln_grid, ln_block>>>(
+      reinterpret_cast<const half*>(cproj.data_ptr()),
+      reinterpret_cast<const half*>(out_proj_weight.data_ptr()),
+      reinterpret_cast<const half*>(out_proj_bias.data_ptr()),
+      reinterpret_cast<half*>(out.data_ptr()), (int)num_queries);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    throw std::runtime_error(cudaGetErrorString(err));
+  }
 
-    return output;
+  return out;
 }
